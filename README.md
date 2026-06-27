@@ -1,16 +1,17 @@
 # jk-metering
 
-The metering shim for the Jedi Knights portfolio. Polls the
-`audit_events` table written by
-[`go-platform/audit/durable`](https://github.com/jedi-knights/go-platform/tree/main/audit/durable),
-transforms each event into a Lago event per
-[identity-platform-go ADR-0019](https://github.com/jedi-knights/identity-platform-go/blob/main/docs/adr/0019-usage-accounting-and-billing.md),
-and posts to [Lago's Event API](https://docs.getlago.com/api-reference/events/create-an-event).
+The metering plane for the Jedi Knights portfolio. Two binaries from one
+repo per
+[identity-platform-go ADR-0019](https://github.com/jedi-knights/identity-platform-go/blob/main/docs/adr/0019-usage-accounting-and-billing.md):
+
+| Binary | Built from | Role |
+|---|---|---|
+| `jk-metering` | `cmd/worker` | Polls the `audit_events` table written by [`go-platform/audit/durable`](https://github.com/jedi-knights/go-platform/tree/main/audit/durable), transforms each event into a Lago event, posts to [Lago's Event API](https://docs.getlago.com/api-reference/events/create-an-event). |
+| `jk-metering-ingest` | `cmd/ingest` | HTTP entry point so web apps / SPAs can emit billable events through `POST /metering/events` without importing `go-platform/audit`. Validates RS256 bearer tokens against the identity-platform-go JWKS; derives `actor_type` / `actor_id` / `subject_id` from the token; emits through the same durable sink the worker drains. |
 
 - **Language:** Go
-- **Deploy:** Fly.io (worker, no HTTP)
-- **Source:** Postgres `audit_events` table (idempotent via `consumed_at`)
-- **Sink:** self-hosted Lago Event API (idempotent via `transaction_id`)
+- **Deploy:** Fly.io — `fly.toml` for the worker, `fly.ingest.toml` for ingest
+- **Source / sink:** Postgres `audit_events` (idempotent via `consumed_at`); Lago Event API (idempotent via `transaction_id`)
 
 ## Why it exists
 
@@ -27,18 +28,23 @@ and Lago dedupes by `transaction_id` (no re-bill on retry).
 Strict hexagonal, mirroring the rest of the portfolio.
 
 ```
-cmd/main.go          composition root, signal handling
+cmd/
+├── worker/main.go     composition root for jk-metering (worker)
+└── ingest/main.go     composition root for jk-metering-ingest (HTTP)
 internal/
-├── config/          viper-based env config (METERING_*)
-├── domain/          AuditEvent + LagoEvent value types
-├── ports/           EventSource + MeterSink interfaces
-├── application/
-│   ├── transformer  audit event → Lago event (pure, no I/O)
-│   └── service      poll → transform → push → mark loop
-└── adapters/
-    └── outbound/
-        ├── postgres/  EventSource backed by audit_events
-        └── lago/      MeterSink posting to Lago Event API
+├── config/            viper-based env config (METERING_*)
+├── domain/            AuditEvent + LagoEvent value types
+├── ports/             EventSource + MeterSink interfaces
+├── application/       (worker only)
+│   ├── transformer    audit event → Lago event (pure, no I/O)
+│   └── service        poll → transform → push → mark loop
+├── ingest/            (ingest only)
+│   ├── handler        POST /metering/events
+│   ├── auth           RS256 bearer-token middleware
+│   └── jwks           cached JWKS fetcher
+└── adapters/outbound/
+    ├── postgres/      EventSource backed by audit_events
+    └── lago/          MeterSink posting to Lago Event API
 ```
 
 The transformer is a pure property pump — every audit event becomes
@@ -50,7 +56,10 @@ metering-shim changes — only Lago admin configuration.
 
 ## Configuration
 
-All variables under the `METERING_` prefix.
+All variables under the `METERING_` prefix. Both binaries share the
+audit DSN and logging configuration; each has its own additional set.
+
+### Worker (`jk-metering`)
 
 | Variable | Required | Default | Purpose |
 |---|---|---|---|
@@ -63,6 +72,75 @@ All variables under the `METERING_` prefix.
 | `METERING_METERING_BILLING_IDENTITY` | no | `subject` | Field that becomes `external_subscription_id`: `subject` / `actor` / `client` |
 | `METERING_LOG_LEVEL` | no | `info` | `debug` / `info` / `warn` / `error` |
 | `METERING_LOG_FORMAT` | no | `json` | `json` / `text` |
+
+### Ingest (`jk-metering-ingest`)
+
+| Variable | Required | Default | Purpose |
+|---|---|---|---|
+| `METERING_AUDIT_DSN` | yes | — | Postgres DSN for the `audit_events` table (shared with worker) |
+| `METERING_INGEST_LISTEN_ADDR` | no | `:8090` | HTTP bind address |
+| `METERING_INGEST_JWKS_URL` | yes | — | Identity-platform-go JWKS URL |
+| `METERING_INGEST_EXPECTED_ISSUER` | no | — | Required `iss` claim; unset disables issuer enforcement (dev only) |
+| `METERING_INGEST_SERVICE_NAME` | no | `jk-metering-ingest` | Stamped on `Event.Service` |
+| `METERING_LOG_LEVEL` | no | `info` | shared |
+| `METERING_LOG_FORMAT` | no | `json` | shared |
+
+## HTTP API (ingest)
+
+### `POST /metering/events`
+
+Emit a billable event. The request body carries the surface
+identifiers; the server derives every audit-envelope field that needs
+trust (actor identity, timestamp, event ID) from the bearer token and
+its own clock.
+
+**Auth.** RS256 bearer token in `Authorization: Bearer <token>`. The
+token must:
+
+- Sign with a key present in the configured JWKS.
+- Carry `iss` matching `METERING_INGEST_EXPECTED_ISSUER` when that env
+  var is set.
+- Include either `metering:emit` (any parent) or
+  `metering:emit:<resource_parent>` in `scope`.
+
+**Request body:**
+
+```json
+{
+  "event_type": "feature_used",
+  "resource_kind": "feature",
+  "resource_id": "pdf_export",
+  "resource_parent": "billpayer",
+  "resource_path": "billpayer/feature/pdf_export",
+  "action": "use",
+  "attrs": { "size_kb": 47 }
+}
+```
+
+| Field | Required | Notes |
+|---|---|---|
+| `event_type` | yes | Free-form, e.g. `feature_used`, `application_started` |
+| `resource_kind` | yes | One of the ADR-0019 enum values (`feature`, `application`, …) |
+| `resource_parent` | yes | The surface the principal is authorised to emit for |
+| `resource_path` | yes | Must begin with `resource_parent + "/"` (or equal `resource_parent`) |
+| `resource_id` | no | Leaf identifier |
+| `action` | no | Defaults to `use` |
+| `attrs` | no | Free-form property bag forwarded verbatim to Lago |
+
+**Response codes:**
+
+| Status | Meaning |
+|---|---|
+| 202 Accepted | Event persisted to `audit_events`; worker will push to Lago on next tick |
+| 400 Bad Request | Malformed JSON, missing required field, or path/parent mismatch |
+| 401 Unauthorized | Missing / invalid / wrong-issuer bearer token |
+| 403 Forbidden | Token lacks `metering:emit:<parent>` (or `metering:emit`) scope |
+| 500 Internal Server Error | Audit durable sink could not persist the event |
+| 405 Method Not Allowed | Anything other than `POST` |
+
+### `GET /health`
+
+Unauthenticated liveness probe. Returns `{"status":"ok"}`.
 
 ## Quickstart
 
@@ -85,12 +163,22 @@ go run ./cmd
 
 ## Deploy
 
-Fly.io. The included `fly.toml` runs one always-on shared-cpu-1x worker
-with no public HTTP listener.
+Two Fly apps from one repo:
 
 ```bash
-fly secrets set METERING_AUDIT_DSN=... METERING_LAGO_BASE_URL=... METERING_LAGO_API_KEY=...
-fly deploy --remote-only
+# Worker (no public HTTP)
+fly secrets -a jk-metering set \
+  METERING_AUDIT_DSN=... \
+  METERING_LAGO_BASE_URL=... \
+  METERING_LAGO_API_KEY=...
+fly deploy --remote-only -c fly.toml
+
+# Ingest (HTTP, behind the gateway)
+fly secrets -a jk-metering-ingest set \
+  METERING_AUDIT_DSN=... \
+  METERING_INGEST_JWKS_URL=https://auth-server.internal/.well-known/jwks.json \
+  METERING_INGEST_EXPECTED_ISSUER=https://auth-server.internal
+fly deploy --remote-only -c fly.ingest.toml
 ```
 
 ## Idempotency contract
