@@ -12,12 +12,42 @@ import (
 	"github.com/spf13/viper"
 )
 
-// Config is the root configuration tree.
+// Config is the root configuration tree for the worker binary.
 type Config struct {
 	Log      LogConfig      `mapstructure:"log"`
 	Audit    AuditConfig    `mapstructure:"audit"`
 	Lago     LagoConfig     `mapstructure:"lago"`
 	Metering MeteringConfig `mapstructure:"metering"`
+}
+
+// IngestConfig is the root configuration tree for the ingest binary.
+// The worker and ingest binaries share the audit DSN and logging
+// configuration but have disjoint other concerns: worker pushes to
+// Lago, ingest accepts HTTP requests and verifies JWTs.
+type IngestConfig struct {
+	Log    LogConfig          `mapstructure:"log"`
+	Audit  AuditConfig        `mapstructure:"audit"`
+	Ingest IngestServerConfig `mapstructure:"ingest"`
+}
+
+// IngestServerConfig holds the ingest HTTP server's knobs.
+type IngestServerConfig struct {
+	// ListenAddr is the bind address for the HTTP server. Default ":8090".
+	ListenAddr string `mapstructure:"listen_addr"` // METERING_INGEST_LISTEN_ADDR
+
+	// JWKSURL is the URL where the identity-platform-go JWKS document
+	// is published (e.g. https://auth-server.internal/.well-known/jwks.json).
+	// Required. Sourced from METERING_INGEST_JWKS_URL.
+	JWKSURL string `mapstructure:"jwks_url"`
+
+	// ExpectedIssuer is the iss claim value every accepted token must
+	// carry. When empty, issuer is not enforced (development only).
+	// Sourced from METERING_INGEST_EXPECTED_ISSUER.
+	ExpectedIssuer string `mapstructure:"expected_issuer"`
+
+	// ServiceName is stamped on Event.Service for every emitted event.
+	// Default "jk-metering-ingest".
+	ServiceName string `mapstructure:"service_name"`
 }
 
 // LogConfig holds structured logging configuration.
@@ -110,6 +140,53 @@ func Load() (*Config, error) {
 	}
 	if cfg.Lago.APIKey == "" {
 		return nil, fmt.Errorf("validating config: METERING_LAGO_API_KEY is required")
+	}
+	return &cfg, nil
+}
+
+// LoadIngest loads the ingest-binary configuration. The audit DSN is
+// shared with the worker so both processes write to / read from the
+// same audit_events table; the ingest-specific fields configure the
+// HTTP server, JWKS source, and audit identity.
+func LoadIngest() (*IngestConfig, error) {
+	v := viper.New()
+
+	v.SetDefault("log.level", "info")
+	v.SetDefault("log.format", "json")
+	v.SetDefault("log.environment", "development")
+	v.SetDefault("audit.dsn", "")
+	v.SetDefault("audit.table", "audit_events")
+	v.SetDefault("ingest.listen_addr", ":8090")
+	v.SetDefault("ingest.jwks_url", "")
+	v.SetDefault("ingest.expected_issuer", "")
+	v.SetDefault("ingest.service_name", "jk-metering-ingest")
+
+	v.SetConfigName("config")
+	v.SetConfigType("yaml")
+	v.AddConfigPath(".")
+	v.AddConfigPath("./config")
+
+	v.SetEnvPrefix("METERING")
+	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
+	v.AutomaticEnv()
+
+	if err := v.ReadInConfig(); err != nil {
+		var notFound viper.ConfigFileNotFoundError
+		if !errors.As(err, &notFound) {
+			return nil, fmt.Errorf("reading config: %w", err)
+		}
+	}
+
+	var cfg IngestConfig
+	if err := v.Unmarshal(&cfg); err != nil {
+		return nil, fmt.Errorf("unmarshalling config: %w", err)
+	}
+
+	if cfg.Audit.DSN == "" {
+		return nil, fmt.Errorf("validating config: METERING_AUDIT_DSN is required")
+	}
+	if cfg.Ingest.JWKSURL == "" {
+		return nil, fmt.Errorf("validating config: METERING_INGEST_JWKS_URL is required")
 	}
 	return &cfg, nil
 }
