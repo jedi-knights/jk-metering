@@ -1,0 +1,73 @@
+version: '3'
+
+vars:
+  PACKAGE: github.com/jedi-knights/go-platform
+  COVERAGE_FILE: coverage.out
+  COVERAGE_HTML: coverage.html
+
+tasks:
+  default:
+    desc: Show available tasks
+    cmds:
+      - task --list
+
+  build:
+    desc: Build all packages
+    cmds:
+      - go build ./...
+
+  test:
+    desc: Run all tests with race detector
+    cmds:
+      - go test ./... -race -count=1
+
+  test-v:
+    desc: Run all tests verbosely with race detector
+    cmds:
+      - go test ./... -race -count=1 -v
+
+  cover:
+    desc: Run tests with coverage profile and HTML report
+    cmds:
+      - go test ./... -coverprofile={{.COVERAGE_FILE}}
+      - go tool cover -html={{.COVERAGE_FILE}} -o {{.COVERAGE_HTML}}
+      - echo "Coverage report written to {{.COVERAGE_HTML}}"
+    generates:
+      - "{{.COVERAGE_FILE}}"
+      - "{{.COVERAGE_HTML}}"
+
+  lint:
+    desc: Run golangci-lint
+    cmds:
+      - golangci-lint run ./...
+
+  lint-fix:
+    desc: Run golangci-lint with auto-fix
+    cmds:
+      - golangci-lint run --fix ./...
+
+  fmt:
+    desc: Format code
+    cmds:
+      - go fmt ./...
+
+  tidy:
+    desc: Tidy and verify go.mod
+    cmds:
+      - go mod tidy
+      - go mod verify
+
+  clean:
+    desc: Clean build artifacts
+    cmds:
+      - rm -f {{.COVERAGE_FILE}}
+      - rm -f {{.COVERAGE_HTML}}
+      - go clean ./...
+
+  ci:
+    desc: Run the full CI pipeline (tidy → lint → test → build)
+    cmds:
+      - task: tidy
+      - task: lint
+      - task: test
+      - task: build

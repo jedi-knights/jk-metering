@@ -1,0 +1,30 @@
+# Release configuration for go-platform.
+#
+# go-platform is a single Go module with multiple subpackages (apperrors,
+# container, httputil, jwtutil, testutil). All subpackages release together
+# under a single repo-wide version tag — there is no per-package versioning.
+#
+# Versions follow semver derived from Conventional Commits on main:
+#   feat: → minor bump
+#   fix:, perf:, refactor: → patch bump
+#   feat! or "BREAKING CHANGE:" footer → major bump
+#   docs, chore, ci, style, test → no release
+#
+# Per CLAUDE.md, while the surface is stabilising releases stay at v0.x.y.
+# The v1.0.0 tag will mark the API-stability commitment.
+
+release_mode: repo
+tag_format: "v{{.Version}}"
+
+# go-semantic-release does not auto-detect the GitHub repository from the
+# git remote — it reads owner/repo from this config. Without them, the
+# create-release POST hits https://api.github.com/repos///releases and
+# fails with 404 (the tag is still created locally, but the release page
+# is not).
+github:
+  owner: jedi-knights
+  repo: go-platform
+
+branches:
+  - name: main
+    is_default: true

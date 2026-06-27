@@ -1,0 +1,13 @@
+/bin/
+/jk-metering
+*.test
+*.out
+*.coverprofile
+coverage.txt
+.env
+.env.*
+!.env.example
+.idea/
+.vscode/
+*.swp
+.DS_Store

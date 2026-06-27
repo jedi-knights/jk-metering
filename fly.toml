@@ -1,0 +1,19 @@
+app = "jk-metering"
+primary_region = "iad"
+kill_signal = "SIGTERM"
+kill_timeout = 30
+
+[build]
+  dockerfile = "Dockerfile"
+
+[deploy]
+  strategy = "rolling"
+
+# This service is a polling worker — no HTTP listener, no Fly-managed
+# auto-stop. Keep one machine always-on so audit_events are drained
+# continuously.
+[[vm]]
+  cpu_kind = "shared"
+  cpus = 1
+  memory = "256mb"
+  size = "shared-cpu-1x"
