@@ -9,6 +9,23 @@ kill_timeout = 30
 [deploy]
   strategy = "rolling"
 
+# Non-secret operational defaults. Secrets (METERING_AUDIT_DSN,
+# METERING_LAGO_API_KEY) are set via `fly secrets set` — never in this
+# file. Overriding these numbers should be done via `fly secrets set`
+# for consistency; the values below match the application's compiled-in
+# defaults so the log line at startup is legible either way.
+[env]
+  METERING_LOG_LEVEL = "info"
+  METERING_LOG_FORMAT = "json"
+  METERING_METERING_POLL_INTERVAL_SECONDS = "5"
+  METERING_METERING_BATCH_SIZE = "100"
+  METERING_METERING_BILLING_IDENTITY = "subject"
+  # E6-S1 AC (issue #166): heartbeat every 60s; ERROR-level log line
+  # when the oldest unconsumed row is > 5 min old. Fly log-based
+  # alerts fire on that ERROR marker.
+  METERING_METERING_HEARTBEAT_INTERVAL_SECONDS = "60"
+  METERING_METERING_LAG_ALERT_SECONDS = "300"
+
 # This service is a polling worker — no HTTP listener, no Fly-managed
 # auto-stop. Keep one machine always-on so audit_events are drained
 # continuously.
@@ -17,3 +34,13 @@ kill_timeout = 30
   cpus = 1
   memory = "256mb"
   size = "shared-cpu-1x"
+
+# Auto-restart on crash so a transient panic recovers without paging;
+# max_restarts is deliberately generous — a repeatedly-crashing worker
+# will surface first via the log-based alert on the heartbeat line.
+[services.concurrency]
+  hard_limit = 0
+  soft_limit = 0
+
+[[restart]]
+  policy = "always"

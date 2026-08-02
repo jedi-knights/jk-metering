@@ -59,7 +59,7 @@ type LagoEvent struct {
 
 // LagoEventWrapper is the outermost JSON shape Lago's Event API expects.
 // Lago wraps the event under an "event" key — this struct exists so the
-// transport adapter can serialise the right shape without sprinkling
+// transport adapter can serialize the right shape without sprinkling
 // JSON-key knowledge through the application layer.
 type LagoEventWrapper struct {
 	Event LagoEvent `json:"event"`

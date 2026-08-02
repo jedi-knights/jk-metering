@@ -5,6 +5,7 @@ package ports
 
 import (
 	"context"
+	"time"
 
 	"github.com/jedi-knights/jk-metering/internal/domain"
 )
@@ -22,6 +23,18 @@ type EventSource interface {
 	// successfully delivered to the metering sink. Idempotent — calling
 	// twice with the same ID is a no-op.
 	MarkConsumed(ctx context.Context, eventID string) error
+
+	// OldestUnconsumedAge returns how long the oldest unconsumed event
+	// has been sitting in the source. Returns 0 (nil error) when the
+	// backlog is empty. The heartbeat loop reads this to alert on
+	// consumer lag — a growing value means the worker is not keeping
+	// up with the emitter, either due to a Lago outage, an internal
+	// bottleneck, or an unexpected event volume spike.
+	//
+	// Implementations should compute the age against the source's own
+	// clock (e.g. Postgres now()) rather than the worker's, so a clock
+	// skew between the two never surfaces as false-positive lag.
+	OldestUnconsumedAge(ctx context.Context) (time.Duration, error)
 }
 
 // MeterSink is the outbound port the application uses to push events to

@@ -5,17 +5,20 @@ import (
 	"errors"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/jedi-knights/jk-metering/internal/application"
 	"github.com/jedi-knights/jk-metering/internal/domain"
 )
 
 type fakeSource struct {
-	mu        sync.Mutex
-	pending   []domain.AuditEvent
-	consumed  []string
-	fetchErr  error
+	mu         sync.Mutex
+	pending    []domain.AuditEvent
+	consumed   []string
+	fetchErr   error
 	consumeErr error
+	oldestAge  time.Duration
+	oldestErr  error
 }
 
 func (f *fakeSource) FetchUnconsumed(_ context.Context, _ int) ([]domain.AuditEvent, error) {
@@ -37,6 +40,12 @@ func (f *fakeSource) MarkConsumed(_ context.Context, id string) error {
 	}
 	f.consumed = append(f.consumed, id)
 	return nil
+}
+
+func (f *fakeSource) OldestUnconsumedAge(_ context.Context) (time.Duration, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.oldestAge, f.oldestErr
 }
 
 type fakeSink struct {

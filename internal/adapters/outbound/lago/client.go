@@ -77,7 +77,7 @@ func New(baseURL, apiKey string, httpClient *http.Client) *Client {
 func (c *Client) PushEvent(ctx context.Context, event domain.LagoEvent) error {
 	body, err := json.Marshal(domain.LagoEventWrapper{Event: event})
 	if err != nil {
-		return fmt.Errorf("marshalling event %s: %w", event.TransactionID, err)
+		return fmt.Errorf("marshaling event %s: %w", event.TransactionID, err)
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
 		c.baseURL+DefaultPath, bytes.NewReader(body))
@@ -99,9 +99,9 @@ func (c *Client) PushEvent(ctx context.Context, event domain.LagoEvent) error {
 		// memory growth on a misbehaving server.
 		snippet, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
 		return &APIError{
-			Status:    resp.StatusCode,
-			Body:      strings.TrimSpace(string(snippet)),
-			EventID:   event.TransactionID,
+			Status:  resp.StatusCode,
+			Body:    strings.TrimSpace(string(snippet)),
+			EventID: event.TransactionID,
 		}
 	}
 	return nil
