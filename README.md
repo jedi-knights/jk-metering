@@ -188,6 +188,38 @@ fly secrets -a jk-metering-ingest set \
 fly deploy --remote-only -c fly.ingest.toml
 ```
 
+### Verifying the heartbeat is firing
+
+After a fresh deploy (or any time you want to prove the worker is
+alive), grep for the heartbeat marker in Fly logs:
+
+```bash
+# Recent history — 10 most recent heartbeats:
+fly logs -a jk-metering --no-tail | grep '"msg":"metering heartbeat"' | tail -10
+
+# Live tail — one line every 60s while the worker runs:
+fly logs -a jk-metering | grep heartbeat
+```
+
+Each line is a single JSON record:
+
+```json
+{"time":"...","level":"INFO","msg":"metering heartbeat",
+ "processed_total":0,"failed_total":0,"skipped_total":0,
+ "processed_delta":0,"rate_per_sec":0,"lag_seconds":0,
+ "lag_alert_threshold_seconds":300}
+```
+
+If you see zero-value counters and `lag_seconds=0` at `INFO`, the
+worker is running, connected to Postgres, and there's no unprocessed
+backlog. First non-zero `processed_total` shows up on the first
+heartbeat after real events flow through `audit_events`.
+
+If you see no heartbeat lines at all for more than
+`METERING_METERING_HEARTBEAT_INTERVAL_SECONDS` (60s default), the
+worker is not running — `fly status -a jk-metering` will show the
+machine state.
+
 ### Alerting on consumer lag
 
 The worker emits a heartbeat every `METERING_METERING_HEARTBEAT_INTERVAL_SECONDS`
