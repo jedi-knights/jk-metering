@@ -9,7 +9,8 @@ kill_timeout = 30
 [deploy]
   strategy = "rolling"
 
-# Override the worker default ENTRYPOINT with the ingest binary.
+# Override the Dockerfile's default CMD (worker) with the ingest binary.
+# Requires the Dockerfile to use CMD, not ENTRYPOINT — see Dockerfile.
 [processes]
   app = "/jk-metering-ingest"
 
