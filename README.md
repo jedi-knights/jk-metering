@@ -176,7 +176,7 @@ fly apps create jk-metering                          # once, if not created
 fly secrets -a jk-metering set \
   METERING_AUDIT_DSN=postgres://user:pass@identity-platform-db.internal:5432/identity \
   METERING_LAGO_BASE_URL=http://lago-api.internal:3000 \
-  METERING_LAGO_API_KEY=$(op read op://Ops/lago/api-key)
+  METERING_LAGO_API_KEY=<lago-api-key-from-secret-manager>
 fly deploy --remote-only -c fly.toml
 
 # Ingest (HTTP, behind the gateway)
@@ -203,6 +203,17 @@ level=ERROR msg="metering heartbeat: lag exceeds alert threshold"
 
 The heartbeat is what E6-S1 (issue #166) wires up; the alert channel
 lives outside this repo (Fly dashboard / PagerDuty webhook).
+
+**Detection latency.** The alert fires on the next heartbeat after lag
+crosses the threshold — up to `METERING_METERING_HEARTBEAT_INTERVAL_SECONDS`
+(default 60s) of extra delay. Shorten the heartbeat interval if you
+need tighter detection, at the cost of more log volume.
+
+**Fail-closed on lag-query failures.** If the lag query itself errors
+(schema drift, table missing, DB read replica down), the heartbeat
+emits the alert line at `ERROR` with a `lag_query_error` attribute.
+The Fly filter above still fires — a broken lag query cannot silently
+disable the alert.
 
 ## Idempotency contract
 

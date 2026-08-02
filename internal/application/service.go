@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -35,11 +36,17 @@ type MeteringService struct {
 	// at ERROR level — Fly log-based alerts fire on this line per the
 	// E6-S1 AC on issue #166.
 	lagAlertThreshold time.Duration
-	// now sources the wall clock for rate calculation; tests inject a
-	// fixed clock to pin rate/lag arithmetic without racing time.Now.
+	// now stamps both the rate window's start (lastHeartbeatAt) and its
+	// end at heartbeat time. Tests inject a fixed clock to pin
+	// rate/elapsed arithmetic without racing time.Now.
 	now func() time.Time
-	// heartbeat-loop-owned state: touched only from emitHeartbeat and
-	// its constructor path, both of which run on the Run goroutine.
+	// hbMu guards the heartbeat-owned state below. Run drives the
+	// heartbeat single-writer via its select, but the exported
+	// TestOnlyEmitHeartbeat helper (see helpers_test.go) also invokes
+	// emitHeartbeat and could race with Run in a poorly-constructed
+	// test — the mutex closes that door without adding real overhead
+	// on the production path (uncontended lock is a handful of ns).
+	hbMu            sync.Mutex
 	lastProcessed   uint64
 	lastHeartbeatAt time.Time
 
@@ -120,16 +127,20 @@ func applyServiceDefaults(cfg Config) Config {
 	return cfg
 }
 
-// EmitHeartbeat writes one INFO (or ERROR when lag exceeds
-// lagAlertThreshold) log line carrying the rolling counters, the
-// consumption rate since the previous heartbeat, and the age of the
-// oldest unconsumed row.
+// emitHeartbeat writes one INFO (or ERROR when lag exceeds
+// lagAlertThreshold or the lag query itself failed) log line carrying
+// the rolling counters, the consumption rate since the previous
+// heartbeat, and the age of the oldest unconsumed row.
 //
-// Exported so tests can drive the heartbeat directly; Run schedules
-// this on the configured interval. Callers outside Run must not
-// invoke this concurrently — the lastProcessed / lastHeartbeatAt
-// bookkeeping is single-writer.
-func (s *MeteringService) EmitHeartbeat(ctx context.Context) {
+// Unexported: Run drives it via its select loop; tests reach it via
+// [MeteringService.TestOnlyEmitHeartbeat] which delegates here. The
+// hbMu lock is held across the whole emission so lastProcessed and
+// lastHeartbeatAt cannot be read torn even if a badly-constructed
+// test races Run.
+func (s *MeteringService) emitHeartbeat(ctx context.Context) {
+	s.hbMu.Lock()
+	defer s.hbMu.Unlock()
+
 	stats := s.Stats()
 	processedNow := stats.Processed
 	delta := processedNow - s.lastProcessed
@@ -139,12 +150,7 @@ func (s *MeteringService) EmitHeartbeat(ctx context.Context) {
 		rate = float64(delta) / elapsed.Seconds()
 	}
 	lag, lagErr := s.source.OldestUnconsumedAge(ctx)
-	if lagErr != nil {
-		// A lag query failure is informational — the tick loop is what
-		// actually drains events. Log at WARN so the operator sees it
-		// without pretending the whole worker is unhealthy.
-		s.logger.Warn("heartbeat: lag query failed", "error", lagErr)
-	}
+
 	args := []any{
 		"processed_total", processedNow,
 		"failed_total", stats.Failed,
@@ -154,9 +160,18 @@ func (s *MeteringService) EmitHeartbeat(ctx context.Context) {
 		"lag_seconds", lag.Seconds(),
 		"lag_alert_threshold_seconds", s.lagAlertThreshold.Seconds(),
 	}
-	if lag > s.lagAlertThreshold {
+	switch {
+	case lagErr != nil:
+		// Fail closed: a systematically failing lag query would
+		// otherwise leave the ERROR-level alert dark forever because
+		// the WARN-only path never carries the alert message.
+		// Escalate here so the Fly log-based filter still fires and an
+		// operator hears about the gap.
+		args = append(args, "lag_query_error", lagErr.Error())
+		s.logger.Error("metering heartbeat: lag exceeds alert threshold (lag query failed)", args...)
+	case lag > s.lagAlertThreshold:
 		s.logger.Error("metering heartbeat: lag exceeds alert threshold", args...)
-	} else {
+	default:
 		s.logger.Info("metering heartbeat", args...)
 	}
 	s.lastProcessed = processedNow
@@ -196,7 +211,8 @@ func (s *MeteringService) Run(ctx context.Context, interval time.Duration) error
 	// timer fire — keeps the steady-state behavior the same whether the
 	// service is freshly started or has been polling for hours.
 	s.tickAndLog(ctx)
-	hbCh := s.heartbeatChan()
+	hbCh, hbStop := s.heartbeatTicker()
+	defer hbStop()
 	for {
 		select {
 		case <-ctx.Done():
@@ -204,24 +220,23 @@ func (s *MeteringService) Run(ctx context.Context, interval time.Duration) error
 		case <-t.C:
 			s.tickAndLog(ctx)
 		case <-hbCh:
-			s.EmitHeartbeat(ctx)
+			s.emitHeartbeat(ctx)
 		}
 	}
 }
 
-// heartbeatChan returns the heartbeat timer channel. A zero
-// HeartbeatInterval yields a nil channel — receiving from nil blocks
-// forever, which cleanly disables the heartbeat case of Run's select
-// without special-casing the config.
-func (s *MeteringService) heartbeatChan() <-chan time.Time {
+// heartbeatTicker returns the heartbeat timer channel and its Stop
+// hook. A zero HeartbeatInterval yields a nil channel and a no-op
+// stop — receiving from nil blocks forever, which cleanly disables
+// the heartbeat case of Run's select without special-casing the
+// config. Callers must defer the stop so the underlying Ticker does
+// not leak when Run returns.
+func (s *MeteringService) heartbeatTicker() (<-chan time.Time, func()) {
 	if s.heartbeatInterval <= 0 {
-		return nil
+		return nil, func() {}
 	}
-	// The Ticker leaks on process exit; acceptable since Run runs
-	// until ctx cancellation and the process terminates immediately
-	// after. A follow-up can plumb Stop through if Run is ever hosted
-	// inside a longer-lived container.
-	return time.NewTicker(s.heartbeatInterval).C
+	t := time.NewTicker(s.heartbeatInterval)
+	return t.C, t.Stop
 }
 
 // tickAndLog runs one Tick and logs any error at ERROR level, except

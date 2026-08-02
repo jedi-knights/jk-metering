@@ -35,12 +35,8 @@ kill_timeout = 30
   memory = "256mb"
   size = "shared-cpu-1x"
 
-# Auto-restart on crash so a transient panic recovers without paging;
-# max_restarts is deliberately generous — a repeatedly-crashing worker
-# will surface first via the log-based alert on the heartbeat line.
-[services.concurrency]
-  hard_limit = 0
-  soft_limit = 0
-
+# Auto-restart on crash so a transient panic recovers without paging.
+# A repeatedly-crashing worker still surfaces via the ERROR-level
+# heartbeat line (lag climbs → the Fly log-based alert fires).
 [[restart]]
   policy = "always"
