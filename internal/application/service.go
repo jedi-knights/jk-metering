@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -27,6 +28,28 @@ type MeteringService struct {
 	billingIdentity BillingIdentityField
 	batchSize       int
 
+	// heartbeatInterval controls how often Run emits a heartbeat log
+	// line with the rolling counters + lag. Zero disables the
+	// heartbeat entirely (used by tests that drive Tick directly).
+	heartbeatInterval time.Duration
+	// lagAlertThreshold is the age above which a heartbeat is emitted
+	// at ERROR level — Fly log-based alerts fire on this line per the
+	// E6-S1 AC on issue #166.
+	lagAlertThreshold time.Duration
+	// now stamps both the rate window's start (lastHeartbeatAt) and its
+	// end at heartbeat time. Tests inject a fixed clock to pin
+	// rate/elapsed arithmetic without racing time.Now.
+	now func() time.Time
+	// hbMu guards the heartbeat-owned state below. Run drives the
+	// heartbeat single-writer via its select, but the exported
+	// TestOnlyEmitHeartbeat helper (see helpers_test.go) also invokes
+	// emitHeartbeat and could race with Run in a poorly-constructed
+	// test — the mutex closes that door without adding real overhead
+	// on the production path (uncontended lock is a handful of ns).
+	hbMu            sync.Mutex
+	lastProcessed   uint64
+	lastHeartbeatAt time.Time
+
 	processed atomic.Uint64
 	failed    atomic.Uint64
 	skipped   atomic.Uint64
@@ -38,7 +61,25 @@ type Config struct {
 	Logger          *slog.Logger
 	BillingIdentity BillingIdentityField
 	BatchSize       int
+
+	// HeartbeatInterval controls how often Run emits a heartbeat log
+	// line with the rolling counters + lag. Zero disables the
+	// heartbeat — set explicitly in tests so a rapid Tick loop is not
+	// polluted with heartbeat noise.
+	HeartbeatInterval time.Duration
+	// LagAlertThreshold is the oldest-unconsumed-age above which a
+	// heartbeat escalates to ERROR level so a Fly log-based alert
+	// fires. Zero defaults to 5 min per the E6-S1 AC.
+	LagAlertThreshold time.Duration
+	// Now overrides the wall clock used by the heartbeat rate
+	// calculation. Zero-value (nil) defaults to time.Now.
+	Now func() time.Time
 }
+
+// DefaultLagAlertThreshold is the E6-S1 AC-mandated ceiling on the age
+// of the oldest unconsumed row. Above this, the heartbeat log line is
+// emitted at ERROR level so a Fly log-based alert fires.
+const DefaultLagAlertThreshold = 5 * time.Minute
 
 // NewMeteringService constructs the service. nil dependencies panic at
 // the composition root so wiring errors surface loudly. BatchSize <= 0
@@ -50,25 +91,91 @@ func NewMeteringService(source ports.EventSource, sink ports.MeterSink, cfg Conf
 	if sink == nil {
 		panic("application: NewMeteringService called with nil MeterSink")
 	}
-	logger := cfg.Logger
-	if logger == nil {
-		logger = slog.Default()
-	}
-	batchSize := cfg.BatchSize
-	if batchSize <= 0 {
-		batchSize = 100
-	}
-	billing := cfg.BillingIdentity
-	if billing == "" {
-		billing = BillingIdentitySubject
-	}
+	cfg = applyServiceDefaults(cfg)
 	return &MeteringService{
-		source:          source,
-		sink:            sink,
-		logger:          logger,
-		billingIdentity: billing,
-		batchSize:       batchSize,
+		source:            source,
+		sink:              sink,
+		logger:            cfg.Logger,
+		billingIdentity:   cfg.BillingIdentity,
+		batchSize:         cfg.BatchSize,
+		heartbeatInterval: cfg.HeartbeatInterval,
+		lagAlertThreshold: cfg.LagAlertThreshold,
+		now:               cfg.Now,
+		lastHeartbeatAt:   cfg.Now(),
 	}
+}
+
+// applyServiceDefaults fills in the zero-value config fields with their
+// documented defaults. Extracted so NewMeteringService stays under the
+// gocyclo cap; every branch here maps to a Config field's docstring.
+func applyServiceDefaults(cfg Config) Config {
+	if cfg.Logger == nil {
+		cfg.Logger = slog.Default()
+	}
+	if cfg.BatchSize <= 0 {
+		cfg.BatchSize = 100
+	}
+	if cfg.BillingIdentity == "" {
+		cfg.BillingIdentity = BillingIdentitySubject
+	}
+	if cfg.LagAlertThreshold <= 0 {
+		cfg.LagAlertThreshold = DefaultLagAlertThreshold
+	}
+	if cfg.Now == nil {
+		cfg.Now = time.Now
+	}
+	return cfg
+}
+
+// emitHeartbeat writes one INFO (or ERROR when lag exceeds
+// lagAlertThreshold or the lag query itself failed) log line carrying
+// the rolling counters, the consumption rate since the previous
+// heartbeat, and the age of the oldest unconsumed row.
+//
+// Unexported: Run drives it via its select loop; tests reach it via
+// [MeteringService.TestOnlyEmitHeartbeat] which delegates here. The
+// hbMu lock is held across the whole emission so lastProcessed and
+// lastHeartbeatAt cannot be read torn even if a badly-constructed
+// test races Run.
+func (s *MeteringService) emitHeartbeat(ctx context.Context) {
+	s.hbMu.Lock()
+	defer s.hbMu.Unlock()
+
+	stats := s.Stats()
+	processedNow := stats.Processed
+	delta := processedNow - s.lastProcessed
+	elapsed := s.now().Sub(s.lastHeartbeatAt)
+	rate := 0.0
+	if elapsed > 0 {
+		rate = float64(delta) / elapsed.Seconds()
+	}
+	lag, lagErr := s.source.OldestUnconsumedAge(ctx)
+
+	args := []any{
+		"processed_total", processedNow,
+		"failed_total", stats.Failed,
+		"skipped_total", stats.Skipped,
+		"processed_delta", delta,
+		"rate_per_sec", rate,
+		"lag_seconds", lag.Seconds(),
+		"lag_alert_threshold_seconds", s.lagAlertThreshold.Seconds(),
+	}
+	switch {
+	case lagErr != nil:
+		// Fail closed: a systematically failing lag query would
+		// otherwise leave the ERROR-level alert dark forever because
+		// the WARN-only path never carries the alert message.
+		// Escalate here so the Fly log-based filter still fires and an
+		// operator hears about the gap.
+		args = append(args, "lag_query_error", lagErr.Error())
+		s.logger.Error("metering heartbeat: lag exceeds alert threshold (lag query failed)", args...)
+	case lag > s.lagAlertThreshold:
+		s.logger.Error("metering heartbeat: lag exceeds alert threshold", args...)
+	default:
+		s.logger.Info("metering heartbeat", args...)
+	}
+	s.lastProcessed = processedNow
+	s.lastHeartbeatAt = s.now()
 }
 
 // Stats is a snapshot of the service's counters. Useful for exporting as
@@ -91,7 +198,7 @@ func (s *MeteringService) Stats() Stats {
 	}
 }
 
-// Run blocks until ctx is cancelled, fetching and forwarding events on
+// Run blocks until ctx is canceled, fetching and forwarding events on
 // the configured interval. Use [MeteringService.Tick] when an external
 // scheduler (test harness, lambda) drives the loop instead.
 func (s *MeteringService) Run(ctx context.Context, interval time.Duration) error {
@@ -103,18 +210,42 @@ func (s *MeteringService) Run(ctx context.Context, interval time.Duration) error
 	// Run an initial tick immediately rather than waiting for the first
 	// timer fire — keeps the steady-state behavior the same whether the
 	// service is freshly started or has been polling for hours.
-	if err := s.Tick(ctx); err != nil && !ctxCanceled(ctx) {
-		s.logger.Error("metering tick failed", "error", err)
-	}
+	s.tickAndLog(ctx)
+	hbCh, hbStop := s.heartbeatTicker()
+	defer hbStop()
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-t.C:
-			if err := s.Tick(ctx); err != nil && !ctxCanceled(ctx) {
-				s.logger.Error("metering tick failed", "error", err)
-			}
+			s.tickAndLog(ctx)
+		case <-hbCh:
+			s.emitHeartbeat(ctx)
 		}
+	}
+}
+
+// heartbeatTicker returns the heartbeat timer channel and its Stop
+// hook. A zero HeartbeatInterval yields a nil channel and a no-op
+// stop — receiving from nil blocks forever, which cleanly disables
+// the heartbeat case of Run's select without special-casing the
+// config. Callers must defer the stop so the underlying Ticker does
+// not leak when Run returns.
+func (s *MeteringService) heartbeatTicker() (<-chan time.Time, func()) {
+	if s.heartbeatInterval <= 0 {
+		return nil, func() {}
+	}
+	t := time.NewTicker(s.heartbeatInterval)
+	return t.C, t.Stop
+}
+
+// tickAndLog runs one Tick and logs any error at ERROR level, except
+// when ctx has already been canceled — the tick's failure is expected
+// on shutdown and would otherwise generate a noise line at every
+// deploy.
+func (s *MeteringService) tickAndLog(ctx context.Context) {
+	if err := s.Tick(ctx); err != nil && !ctxCanceled(ctx) {
+		s.logger.Error("metering tick failed", "error", err)
 	}
 }
 

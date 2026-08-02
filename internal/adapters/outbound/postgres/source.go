@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -26,6 +27,7 @@ const DefaultTable = "audit_events"
 // pool.
 type Querier interface {
 	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
 	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
 }
 
@@ -119,6 +121,29 @@ func (s *Source) MarkConsumed(ctx context.Context, eventID string) error {
 	return nil
 }
 
+// OldestUnconsumedAge returns how long the oldest unconsumed row has
+// been sitting in audit_events. The age is computed against Postgres's
+// clock via now() - MIN(created_at) so a worker/DB clock skew never
+// produces false-positive lag. Returns 0 when the backlog is empty.
+func (s *Source) OldestUnconsumedAge(ctx context.Context) (time.Duration, error) {
+	// #nosec G201 -- table name is validated by validateIdentifier at construction.
+	// EXTRACT(EPOCH FROM ...) yields fractional seconds, which the
+	// worker converts to a Duration below. COALESCE guards against the
+	// empty-backlog case where MIN(created_at) is NULL.
+	query := fmt.Sprintf(
+		`SELECT COALESCE(EXTRACT(EPOCH FROM (now() - MIN(created_at))), 0)::float8
+		   FROM %s
+		  WHERE consumed_at IS NULL`, s.table)
+	var seconds float64
+	if err := s.db.QueryRow(ctx, query).Scan(&seconds); err != nil {
+		return 0, fmt.Errorf("querying oldest unconsumed age from %s: %w", s.table, err)
+	}
+	if seconds <= 0 {
+		return 0, nil
+	}
+	return time.Duration(seconds * float64(time.Second)), nil
+}
+
 // validateIdentifier guards against SQL injection in the table-name
 // slot. Same shape as go-platform/audit/durable.
 func validateIdentifier(s string) error {
@@ -129,17 +154,32 @@ func validateIdentifier(s string) error {
 		return errors.New("identifier exceeds 63 characters")
 	}
 	for i, r := range s {
-		switch {
-		case r >= 'a' && r <= 'z',
-			r >= 'A' && r <= 'Z',
-			r == '_':
-		case r >= '0' && r <= '9':
-			if i == 0 {
-				return errors.New("identifier cannot start with a digit")
-			}
-		default:
-			return fmt.Errorf("identifier contains invalid character %q at position %d", r, i)
+		if err := validateIdentifierRune(r, i); err != nil {
+			return err
 		}
 	}
 	return nil
+}
+
+// validateIdentifierRune enforces the per-rune rules validateIdentifier
+// walks. Extracted so validateIdentifier stays under the gocyclo cap.
+// Digits at position 0 are rejected explicitly since a leading digit
+// makes the identifier ambiguous with a numeric literal.
+func validateIdentifierRune(r rune, i int) error {
+	if isIdentAlpha(r) {
+		return nil
+	}
+	if r >= '0' && r <= '9' {
+		if i == 0 {
+			return errors.New("identifier cannot start with a digit")
+		}
+		return nil
+	}
+	return fmt.Errorf("identifier contains invalid character %q at position %d", r, i)
+}
+
+// isIdentAlpha reports whether r is a letter or underscore. Extracted
+// from validateIdentifierRune so the digit rules stay isolated.
+func isIdentAlpha(r rune) bool {
+	return (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || r == '_'
 }

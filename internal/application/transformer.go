@@ -37,46 +37,20 @@ const (
 // does not interpret event semantics.
 //
 // billingIdentity selects which field becomes external_subscription_id:
-// subject (default), actor, or client. An empty / unrecognised value
+// subject (default), actor, or client. An empty / unrecognized value
 // defaults to subject — the ADR-0019 "user owns the cost" rule.
 func Transform(e domain.AuditEvent, billingIdentity BillingIdentityField) domain.LagoEvent {
 	props := map[string]any{
-		"event_type":  e.EventType,
-		"service":     e.Service,
-		"actor_type":  e.ActorType,
-		"actor_id":    e.ActorID,
-		"resource":    e.Resource,
-		"action":      e.Action,
-		"decision":    e.Decision,
+		"event_type":     e.EventType,
+		"service":        e.Service,
+		"actor_type":     e.ActorType,
+		"actor_id":       e.ActorID,
+		"resource":       e.Resource,
+		"action":         e.Action,
+		"decision":       e.Decision,
 		"schema_version": e.SchemaVersion,
 	}
-	if e.SubjectID != "" {
-		props["subject_id"] = e.SubjectID
-	}
-	if e.ClientID != "" {
-		props["client_id"] = e.ClientID
-	}
-	if e.ResourceKind != "" {
-		props["resource_kind"] = e.ResourceKind
-	}
-	if e.ResourceID != "" {
-		props["resource_id"] = e.ResourceID
-	}
-	if e.ResourceParent != "" {
-		props["resource_parent"] = e.ResourceParent
-	}
-	if e.ResourcePath != "" {
-		props["resource_path"] = e.ResourcePath
-	}
-	if e.Reason != "" {
-		props["reason"] = e.Reason
-	}
-	if e.TraceID != "" {
-		props["trace_id"] = e.TraceID
-	}
-	if e.CorrelationID != "" {
-		props["correlation_id"] = e.CorrelationID
-	}
+	addOptionalProps(props, e)
 	for k, v := range e.Attrs {
 		// Audit attrs win on key collisions — they are the most specific
 		// signal and the metering shim respects what the emitter put there.
@@ -88,6 +62,32 @@ func Transform(e domain.AuditEvent, billingIdentity BillingIdentityField) domain
 		Code:                   LagoEventCode,
 		Timestamp:              e.Timestamp.Unix(),
 		Properties:             props,
+	}
+}
+
+// addOptionalProps sets each optional audit envelope field on the props
+// map when non-empty. Extracted so Transform stays under the gocyclo
+// cap; every entry here is a "present in envelope → forward to Lago"
+// mapping with no other logic.
+func addOptionalProps(props map[string]any, e domain.AuditEvent) {
+	optional := []struct {
+		key string
+		val string
+	}{
+		{"subject_id", e.SubjectID},
+		{"client_id", e.ClientID},
+		{"resource_kind", e.ResourceKind},
+		{"resource_id", e.ResourceID},
+		{"resource_parent", e.ResourceParent},
+		{"resource_path", e.ResourcePath},
+		{"reason", e.Reason},
+		{"trace_id", e.TraceID},
+		{"correlation_id", e.CorrelationID},
+	}
+	for _, opt := range optional {
+		if opt.val != "" {
+			props[opt.key] = opt.val
+		}
 	}
 }
 

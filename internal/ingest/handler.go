@@ -46,7 +46,7 @@ type Handler struct {
 // NewHandler constructs the HTTP handler. A nil emitter panics —
 // composition errors are loud at startup. service is stamped on
 // Event.Service for every emitted event so downstream consumers can
-// recognise the ingest path. A nil logger falls back to the default
+// recognize the ingest path. A nil logger falls back to the default
 // slog.Default().
 func NewHandler(emitter audit.Emitter, service string, logger *slog.Logger) *Handler {
 	if emitter == nil {
@@ -66,7 +66,7 @@ func NewHandler(emitter audit.Emitter, service string, logger *slog.Logger) *Han
 //   - 401 on missing / invalid auth (handled by the middleware before
 //     this handler runs).
 //   - 400 on malformed JSON, missing required fields, or a
-//     resource_path the principal is not authorised to emit for.
+//     resource_path the principal is not authorized to emit for.
 //   - 500 on durable-sink failure — per ADR-0019's paid-event policy a
 //     metering event whose audit row could not be persisted must not
 //     be silently dropped.
@@ -79,33 +79,65 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-
-	principal := PrincipalFromContext(r.Context())
+	principal := h.requirePrincipal(w, r)
 	if principal == nil {
-		// Programming error — auth middleware did not run.
-		h.logger.Error("missing principal on context — auth middleware not wired")
-		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
+	req, ok := h.readAndValidateRequest(w, r, principal)
+	if !ok {
+		return
+	}
+	if err := h.emitter.Emit(r.Context(), buildAuditEvent(req, principal, h.service)); err != nil {
+		h.logger.Error("emit failed", "error", err)
+		http.Error(w, "audit emit failed", http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusAccepted)
+}
 
+// requirePrincipal pulls the auth-middleware-populated principal from
+// the context. A missing principal is a wiring bug (auth middleware
+// not installed on the route); log and 500 rather than exposing the
+// endpoint unauthenticated.
+func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) *Principal {
+	principal := PrincipalFromContext(r.Context())
+	if principal == nil {
+		h.logger.Error("missing principal on context — auth middleware not wired")
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return nil
+	}
+	return principal
+}
+
+// readAndValidateRequest parses the JSON body, runs contract validation,
+// and enforces the emit-scope check. Writes the appropriate 4xx status
+// and returns ok=false on any failure so the caller can return.
+func (h *Handler) readAndValidateRequest(w http.ResponseWriter, r *http.Request, principal *Principal) (Request, bool) {
 	r.Body = http.MaxBytesReader(w, r.Body, MaxBodyBytes)
 	var req Request
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeBadRequest(w, decodeErrorMessage(err))
-		return
+		return Request{}, false
 	}
 	if err := req.Validate(); err != nil {
 		writeBadRequest(w, err.Error())
-		return
+		return Request{}, false
 	}
 	if !principalCanEmit(principal, req.ResourceParent) {
 		http.Error(w, "forbidden", http.StatusForbidden)
-		return
+		return Request{}, false
 	}
+	return req, true
+}
 
+// buildAuditEvent projects the ingest Request + auth Principal into the
+// go-platform/audit envelope. Extracted so ServeHTTP stays under the
+// gocyclo cap; the field mapping here is stable and best read as one
+// dense block.
+func buildAuditEvent(req Request, principal *Principal, service string) audit.Event {
 	event := audit.Event{
 		EventType:      req.EventType,
-		Service:        h.service,
+		Service:        service,
 		ActorType:      audit.ActorType(principal.ActorType),
 		ActorID:        principal.ActorID,
 		SubjectID:      principal.SubjectID,
@@ -122,13 +154,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if event.Action == "" {
 		event.Action = "use"
 	}
-
-	if err := h.emitter.Emit(r.Context(), event); err != nil {
-		h.logger.Error("emit failed", "error", err)
-		http.Error(w, "audit emit failed", http.StatusInternalServerError)
-		return
-	}
-	w.WriteHeader(http.StatusAccepted)
+	return event
 }
 
 // Validate returns the first contract violation on the request body, or
@@ -161,7 +187,7 @@ func (r Request) Validate() error {
 
 // principalCanEmit gates which resource_parent values a token may emit
 // for. Scopes carry the parent name in the form metering:emit:<parent>;
-// the bare metering:emit scope authorises emission for any parent and
+// the bare metering:emit scope authorizes emission for any parent and
 // is intended for service-to-service callers.
 func principalCanEmit(p *Principal, parent string) bool {
 	want := "metering:emit:" + parent
@@ -204,4 +230,3 @@ func decodeErrorMessage(err error) string {
 	}
 	return "malformed JSON body"
 }
-

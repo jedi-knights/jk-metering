@@ -70,6 +70,8 @@ audit DSN and logging configuration; each has its own additional set.
 | `METERING_METERING_POLL_INTERVAL_SECONDS` | no | `5` | Polling interval |
 | `METERING_METERING_BATCH_SIZE` | no | `100` | Max events per tick |
 | `METERING_METERING_BILLING_IDENTITY` | no | `subject` | Field that becomes `external_subscription_id`: `subject` / `actor` / `client` |
+| `METERING_METERING_HEARTBEAT_INTERVAL_SECONDS` | no | `60` | Cadence of the rate/lag heartbeat log line |
+| `METERING_METERING_LAG_ALERT_SECONDS` | no | `300` | Oldest-unconsumed age above which the heartbeat escalates to `ERROR` (Fly log-alert signal — E6-S1 AC on issue #166) |
 | `METERING_LOG_LEVEL` | no | `info` | `debug` / `info` / `warn` / `error` |
 | `METERING_LOG_FORMAT` | no | `json` | `json` / `text` |
 
@@ -163,23 +165,55 @@ go run ./cmd
 
 ## Deploy
 
-Two Fly apps from one repo:
+Two Fly apps from one repo. The `.internal` DNS names below assume the
+identity-platform Postgres cluster (`identity-platform-db`) and Lago
+API (`lago-api`) are on the same Fly org so 6PN routing resolves them
+without a public gateway.
 
 ```bash
-# Worker (no public HTTP)
+# Worker (no public HTTP) — E6-S1
+fly apps create jk-metering                          # once, if not created
 fly secrets -a jk-metering set \
-  METERING_AUDIT_DSN=... \
-  METERING_LAGO_BASE_URL=... \
-  METERING_LAGO_API_KEY=...
+  METERING_AUDIT_DSN=postgres://user:pass@identity-platform-db.internal:5432/identity \
+  METERING_LAGO_BASE_URL=http://lago-api.internal:3000 \
+  METERING_LAGO_API_KEY=<lago-api-key-from-secret-manager>
 fly deploy --remote-only -c fly.toml
 
 # Ingest (HTTP, behind the gateway)
+fly apps create jk-metering-ingest                   # once, if not created
 fly secrets -a jk-metering-ingest set \
-  METERING_AUDIT_DSN=... \
+  METERING_AUDIT_DSN=postgres://user:pass@identity-platform-db.internal:5432/identity \
   METERING_INGEST_JWKS_URL=https://auth-server.internal/.well-known/jwks.json \
   METERING_INGEST_EXPECTED_ISSUER=https://auth-server.internal
 fly deploy --remote-only -c fly.ingest.toml
 ```
+
+### Alerting on consumer lag
+
+The worker emits a heartbeat every `METERING_METERING_HEARTBEAT_INTERVAL_SECONDS`
+(default 60) at `INFO` level with `processed_total`, `failed_total`,
+`skipped_total`, `processed_delta`, `rate_per_sec`, and `lag_seconds`.
+When `lag_seconds` exceeds `METERING_METERING_LAG_ALERT_SECONDS` (default
+300 = 5 min), the same line is emitted at `ERROR` level. Configure a
+Fly log-based alert on that marker:
+
+```
+level=ERROR msg="metering heartbeat: lag exceeds alert threshold"
+```
+
+The heartbeat is what E6-S1 (issue #166) wires up; the alert channel
+lives outside this repo (Fly dashboard / PagerDuty webhook).
+
+**Detection latency.** The alert fires on the next heartbeat after lag
+crosses the threshold — up to `METERING_METERING_HEARTBEAT_INTERVAL_SECONDS`
+(default 60s) of extra delay. Shorten the heartbeat interval if you
+need tighter detection, at the cost of more log volume.
+
+**Fail-closed on lag-query failures.** If the lag query itself errors
+(schema drift, table missing, DB read replica down), the heartbeat
+emits the alert line at `ERROR` with a `lag_query_error` attribute.
+The Fly filter above still fires — a broken lag query cannot silently
+disable the alert.
 
 ## Idempotency contract
 

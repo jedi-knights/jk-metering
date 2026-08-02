@@ -93,6 +93,18 @@ type MeteringConfig struct {
 	// external_subscription_id. One of "subject" (default), "actor",
 	// or "client". Other values default to "subject".
 	BillingIdentity string `mapstructure:"billing_identity"`
+
+	// HeartbeatIntervalSeconds is how often the worker emits a heartbeat
+	// log line carrying processed/failed/skipped counters and the
+	// oldest-unconsumed lag. Default 60. Sourced from
+	// METERING_METERING_HEARTBEAT_INTERVAL_SECONDS.
+	HeartbeatIntervalSeconds int `mapstructure:"heartbeat_interval_seconds"`
+
+	// LagAlertSeconds is the threshold above which the heartbeat emits
+	// at ERROR level so an operator log-based alert fires (E6-S1 AC on
+	// issue #166). Default 300 (5 min). Sourced from
+	// METERING_METERING_LAG_ALERT_SECONDS.
+	LagAlertSeconds int `mapstructure:"lag_alert_seconds"`
 }
 
 // Load reads configuration from environment variables (METERING_*) and
@@ -110,6 +122,8 @@ func Load() (*Config, error) {
 	v.SetDefault("metering.poll_interval_seconds", 5)
 	v.SetDefault("metering.batch_size", 100)
 	v.SetDefault("metering.billing_identity", "subject")
+	v.SetDefault("metering.heartbeat_interval_seconds", 60)
+	v.SetDefault("metering.lag_alert_seconds", 300)
 
 	v.SetConfigName("config")
 	v.SetConfigType("yaml")
@@ -129,7 +143,7 @@ func Load() (*Config, error) {
 
 	var cfg Config
 	if err := v.Unmarshal(&cfg); err != nil {
-		return nil, fmt.Errorf("unmarshalling config: %w", err)
+		return nil, fmt.Errorf("unmarshaling config: %w", err)
 	}
 
 	if cfg.Audit.DSN == "" {
@@ -179,7 +193,7 @@ func LoadIngest() (*IngestConfig, error) {
 
 	var cfg IngestConfig
 	if err := v.Unmarshal(&cfg); err != nil {
-		return nil, fmt.Errorf("unmarshalling config: %w", err)
+		return nil, fmt.Errorf("unmarshaling config: %w", err)
 	}
 
 	if cfg.Audit.DSN == "" {

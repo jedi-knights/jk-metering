@@ -99,45 +99,87 @@ func (f *JWKSFetcher) KeyByID(ctx context.Context, kid string) (*rsa.PublicKey, 
 // goroutines see the new keys atomically — the swap happens under the
 // mutex after a successful parse.
 func (f *JWKSFetcher) refresh(ctx context.Context) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, f.url, nil)
+	body, err := f.fetchJWKSBody(ctx)
 	if err != nil {
-		return fmt.Errorf("ingest/jwks: building request: %w", err)
+		return err
 	}
-	resp, err := f.client.Do(req)
+	cached, err := parseJWKSBody(body)
 	if err != nil {
-		return fmt.Errorf("ingest/jwks: fetching %s: %w", f.url, err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode/100 != 2 {
-		return fmt.Errorf("ingest/jwks: %s returned %d", f.url, resp.StatusCode)
-	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if err != nil {
-		return fmt.Errorf("ingest/jwks: reading body: %w", err)
-	}
-	var set jwkSet
-	if err := json.Unmarshal(body, &set); err != nil {
-		return fmt.Errorf("ingest/jwks: decoding JWKS: %w", err)
-	}
-	cached := make(map[string]*rsa.PublicKey, len(set.Keys))
-	for _, k := range set.Keys {
-		if k.Kty != "RSA" || k.N == "" || k.E == "" {
-			continue
-		}
-		pub, err := rsaPublicKeyFromJWK(k)
-		if err != nil {
-			return fmt.Errorf("ingest/jwks: decoding key %q: %w", k.Kid, err)
-		}
-		cached[k.Kid] = pub
-	}
-	if len(cached) == 0 {
-		return errors.New("ingest/jwks: no usable RSA keys in JWKS document")
+		return err
 	}
 	f.mu.Lock()
 	f.cached = cached
 	f.expiresAt = time.Now().Add(f.cacheTTL)
 	f.mu.Unlock()
 	return nil
+}
+
+// fetchJWKSBody issues the HTTP GET and returns the body bytes on a
+// 2xx response. A 1 MiB LimitReader guards against a hostile issuer
+// serving an unbounded body.
+func (f *JWKSFetcher) fetchJWKSBody(ctx context.Context) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, f.url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("ingest/jwks: building request: %w", err)
+	}
+	resp, err := f.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("ingest/jwks: fetching %s: %w", f.url, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode/100 != 2 {
+		return nil, fmt.Errorf("ingest/jwks: %s returned %d", f.url, resp.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return nil, fmt.Errorf("ingest/jwks: reading body: %w", err)
+	}
+	return body, nil
+}
+
+// parseJWKSBody decodes the JWKS envelope and materializes the cached
+// key map. Empty / non-RSA entries are skipped; an empty result is an
+// error (a document with no usable keys means the issuer misconfigured
+// its published set and no signed token would ever verify).
+func parseJWKSBody(body []byte) (map[string]*rsa.PublicKey, error) {
+	var set jwkSet
+	if err := json.Unmarshal(body, &set); err != nil {
+		return nil, fmt.Errorf("ingest/jwks: decoding JWKS: %w", err)
+	}
+	cached, err := decodeJWKEntries(set.Keys)
+	if err != nil {
+		return nil, err
+	}
+	if len(cached) == 0 {
+		return nil, errors.New("ingest/jwks: no usable RSA keys in JWKS document")
+	}
+	return cached, nil
+}
+
+// decodeJWKEntries walks the JWK slice, skipping unusable entries and
+// returning the first decode failure it hits. Extracted so
+// parseJWKSBody stays under the gocyclo cap.
+func decodeJWKEntries(keys []jwk) (map[string]*rsa.PublicKey, error) {
+	cached := make(map[string]*rsa.PublicKey, len(keys))
+	for _, k := range keys {
+		if !isUsableRSAJWK(k) {
+			continue
+		}
+		pub, err := rsaPublicKeyFromJWK(k)
+		if err != nil {
+			return nil, fmt.Errorf("ingest/jwks: decoding key %q: %w", k.Kid, err)
+		}
+		cached[k.Kid] = pub
+	}
+	return cached, nil
+}
+
+// isUsableRSAJWK reports whether the JWK carries the fields we need to
+// materialize an rsa.PublicKey. Non-RSA / partial entries silently
+// skip so a JWKS mixing RSA + EC keys during a migration still verifies
+// the RSA-signed tokens.
+func isUsableRSAJWK(k jwk) bool {
+	return k.Kty == "RSA" && k.N != "" && k.E != ""
 }
 
 // rsaPublicKeyFromJWK decodes the modulus + exponent of a JWK into a

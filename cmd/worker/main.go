@@ -15,10 +15,10 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/jedi-knights/jk-metering/internal/application"
-	"github.com/jedi-knights/jk-metering/internal/config"
 	lagoadapter "github.com/jedi-knights/jk-metering/internal/adapters/outbound/lago"
 	pgadapter "github.com/jedi-knights/jk-metering/internal/adapters/outbound/postgres"
+	"github.com/jedi-knights/jk-metering/internal/application"
+	"github.com/jedi-knights/jk-metering/internal/config"
 )
 
 func main() {
@@ -52,15 +52,19 @@ func run() error {
 		&http.Client{Timeout: lagoadapter.DefaultTimeout})
 
 	svc := application.NewMeteringService(source, sink, application.Config{
-		Logger:          logger,
-		BillingIdentity: application.BillingIdentityField(cfg.Metering.BillingIdentity),
-		BatchSize:       cfg.Metering.BatchSize,
+		Logger:            logger,
+		BillingIdentity:   application.BillingIdentityField(cfg.Metering.BillingIdentity),
+		BatchSize:         cfg.Metering.BatchSize,
+		HeartbeatInterval: time.Duration(cfg.Metering.HeartbeatIntervalSeconds) * time.Second,
+		LagAlertThreshold: time.Duration(cfg.Metering.LagAlertSeconds) * time.Second,
 	})
 
 	logger.Info("metering shim starting",
 		"poll_interval_seconds", cfg.Metering.PollIntervalSeconds,
 		"batch_size", cfg.Metering.BatchSize,
 		"billing_identity", cfg.Metering.BillingIdentity,
+		"heartbeat_interval_seconds", cfg.Metering.HeartbeatIntervalSeconds,
+		"lag_alert_seconds", cfg.Metering.LagAlertSeconds,
 		"audit_table", cfg.Audit.Table)
 
 	interval := time.Duration(cfg.Metering.PollIntervalSeconds) * time.Second
