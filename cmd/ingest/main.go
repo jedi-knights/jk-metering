@@ -41,6 +41,19 @@ func run() error {
 	logger := newLogger(cfg.Log)
 	slog.SetDefault(logger)
 
+	// Emit boot-visible config before any I/O so a misconfigured deploy
+	// surfaces in `fly logs` even when a downstream dependency fails.
+	// Secrets (DSN, API keys) are deliberately excluded.
+	logger.Info("ingest starting",
+		"listen_addr", cfg.Ingest.ListenAddr,
+		"jwks_url", cfg.Ingest.JWKSURL,
+		"expected_issuer", cfg.Ingest.ExpectedIssuer,
+		"service_name", cfg.Ingest.ServiceName,
+	)
+	if cfg.Ingest.ExpectedIssuer == "" {
+		logger.Warn("expected_issuer not set — iss claim will not be enforced (development only)")
+	}
+
 	ctx, cancel := signal.NotifyContext(context.Background(),
 		syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
