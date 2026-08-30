@@ -5,10 +5,11 @@ name: Verify metering
 # jk-metering-ingest, waits for the worker to mark it consumed in
 # audit_events, and asserts Lago received the matching event.
 #
-# audit_events lives on a Fly-internal Postgres reachable only through
-# the 6PN mesh, so the job opens a flyctl proxy to localhost:5432 before
-# invoking the script. All endpoints and credentials come from repo
-# secrets so nothing rotatable ends up in this file.
+# audit_events lives on a Fly Managed Postgres cluster (jk-identity-pg,
+# shared with the identity services). MPG is not app-based, so the tunnel
+# uses `fly mpg proxy <cluster-id>` — plain `flyctl proxy -a` does not
+# work against MPG. All endpoints and credentials come from repo secrets
+# so nothing rotatable ends up in this file.
 #
 # A failed run opens a GitHub issue (self-contained; upgrade to Slack/
 # PagerDuty by adding a step once a webhook is provisioned).
@@ -36,21 +37,21 @@ jobs:
       - name: Set up flyctl
         uses: superfly/flyctl-actions/setup-flyctl@master
 
-      - name: Open flyctl proxy to audit Postgres
+      - name: Open MPG proxy to audit Postgres
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
         run: |
-          nohup flyctl proxy 5432:5432 -a "${{ vars.METERING_AUDIT_PG_APP }}" \
-            > /tmp/flyctl-proxy.log 2>&1 &
-          echo $! > /tmp/flyctl-proxy.pid
+          nohup fly mpg proxy "${{ vars.METERING_AUDIT_PG_CLUSTER_ID }}" -p 5432 \
+            > /tmp/mpg-proxy.log 2>&1 &
+          echo $! > /tmp/mpg-proxy.pid
           # Wait for the tunnel to accept connections. 15s cap is
-          # generous; flyctl proxy typically binds within 2-3s.
+          # generous; fly mpg proxy typically binds within 2-3s.
           for _ in $(seq 1 15); do
             if nc -z 127.0.0.1 5432; then exit 0; fi
             sleep 1
           done
-          echo "flyctl proxy did not bind localhost:5432 within 15s" >&2
-          cat /tmp/flyctl-proxy.log >&2
+          echo "fly mpg proxy did not bind localhost:5432 within 15s" >&2
+          cat /tmp/mpg-proxy.log >&2
           exit 1
 
       - name: Install psql client
@@ -66,11 +67,11 @@ jobs:
           POLL_TIMEOUT_SECONDS: "60"
         run: scripts/verify-metering.sh
 
-      - name: Stop flyctl proxy
+      - name: Stop MPG proxy
         if: always()
         run: |
-          if [[ -f /tmp/flyctl-proxy.pid ]]; then
-            kill "$(cat /tmp/flyctl-proxy.pid)" 2>/dev/null || true
+          if [[ -f /tmp/mpg-proxy.pid ]]; then
+            kill "$(cat /tmp/mpg-proxy.pid)" 2>/dev/null || true
           fi
 
       - name: File issue on failure
