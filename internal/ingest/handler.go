@@ -1,6 +1,7 @@
 package ingest
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -9,8 +10,18 @@ import (
 	"net/http"
 	"strings"
 
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
+
 	"github.com/jedi-knights/go-platform/audit"
 )
+
+// instrumentationName identifies this package's OTel instrumentation
+// scope. The global MeterProvider resolves it; no provider installed
+// (tests) yields a no-op meter so the Add calls below are
+// side-effect-free.
+const instrumentationName = "github.com/jedi-knights/jk-metering/internal/ingest"
 
 // MaxBodyBytes caps the request body. 64 KiB is generous for a single
 // metering event and tight enough that a malicious client cannot exhaust
@@ -41,6 +52,12 @@ type Handler struct {
 	emitter audit.Emitter
 	service string
 	logger  *slog.Logger
+
+	// eventsAccepted counts every request that reaches the 202 branch,
+	// labeled by event_code (the Request.EventType the client sent).
+	// Lets dashboards graph ingest volume per billable-event-type
+	// without reading the audit table.
+	eventsAccepted metric.Int64Counter
 }
 
 // NewHandler constructs the HTTP handler. A nil emitter panics —
@@ -58,7 +75,27 @@ func NewHandler(emitter audit.Emitter, service string, logger *slog.Logger) *Han
 	if service == "" {
 		service = "jk-metering-ingest"
 	}
-	return &Handler{emitter: emitter, service: service, logger: logger}
+	return &Handler{
+		emitter:        emitter,
+		service:        service,
+		logger:         logger,
+		eventsAccepted: newEventsAcceptedCounter(),
+	}
+}
+
+// newEventsAcceptedCounter builds the ingest-accepted counter from
+// the global MeterProvider. OTel's returned counter is always
+// usable (no-op in the error path), so the error is intentionally
+// dropped — a scrape silently returns no series until the provider
+// is installed at startup.
+func newEventsAcceptedCounter() metric.Int64Counter {
+	meter := otel.Meter(instrumentationName)
+	counter, _ := meter.Int64Counter(
+		"metering.events_accepted",
+		metric.WithDescription("Ingest requests that reached the 202 accepted branch, by event_code."),
+		metric.WithUnit("{event}"),
+	)
+	return counter
 }
 
 // ServeHTTP implements POST /metering/events.
@@ -92,7 +129,18 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "audit emit failed", http.StatusInternalServerError)
 		return
 	}
+	h.recordAccepted(r.Context(), req.EventType)
 	w.WriteHeader(http.StatusAccepted)
+}
+
+// recordAccepted increments the metering.events_accepted counter
+// with the event_code label. Nil-safe: the counter is a no-op when
+// no MeterProvider is installed (tests).
+func (h *Handler) recordAccepted(ctx context.Context, eventType string) {
+	if h.eventsAccepted == nil {
+		return
+	}
+	h.eventsAccepted.Add(ctx, 1, metric.WithAttributes(attribute.String("event_code", eventType)))
 }
 
 // requirePrincipal pulls the auth-middleware-populated principal from

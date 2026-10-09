@@ -9,6 +9,23 @@ import (
 	"time"
 
 	"github.com/jedi-knights/jk-metering/internal/ports"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
+)
+
+// instrumentationName identifies the OTel instrumentation scope for
+// counters this package emits. The global MeterProvider resolves it;
+// when no provider is installed (tests) the resulting meter is a
+// no-op so the production call sites below stay side-effect-free.
+const instrumentationName = "github.com/jedi-knights/jk-metering/internal/application"
+
+// Result label values for the metering.events_drained counter.
+// Mirrors the three terminal branches of [MeteringService.Tick].
+const (
+	resultOK      = "ok"
+	resultSkipped = "skipped"
+	resultFailed  = "failed"
 )
 
 // MeteringService is the core orchestration loop. It pulls unconsumed
@@ -53,6 +70,12 @@ type MeteringService struct {
 	processed atomic.Uint64
 	failed    atomic.Uint64
 	skipped   atomic.Uint64
+
+	// eventsDrained records one tick-terminal outcome per audit event
+	// with a result label (ok | skipped | failed). Exposes the same
+	// three counts the heartbeat log line carries, in Prometheus
+	// shape, scraped from /metrics on :9464.
+	eventsDrained metric.Int64Counter
 }
 
 // Config holds the service-level knobs that are passed in at the
@@ -102,7 +125,23 @@ func NewMeteringService(source ports.EventSource, sink ports.MeterSink, cfg Conf
 		lagAlertThreshold: cfg.LagAlertThreshold,
 		now:               cfg.Now,
 		lastHeartbeatAt:   cfg.Now(),
+		eventsDrained:     newEventsDrainedCounter(),
 	}
+}
+
+// newEventsDrainedCounter builds the metering.events_drained counter
+// from the global MeterProvider. A failed registration (unexpected —
+// the OTel SDK's returned counter is always a valid no-op in error
+// paths) is logged at the point of first use rather than crashing
+// startup.
+func newEventsDrainedCounter() metric.Int64Counter {
+	meter := otel.Meter(instrumentationName)
+	counter, _ := meter.Int64Counter(
+		"metering.events_drained",
+		metric.WithDescription("Audit events drained from the queue, labeled by outcome."),
+		metric.WithUnit("{event}"),
+	)
+	return counter
 }
 
 // applyServiceDefaults fills in the zero-value config fields with their
@@ -268,9 +307,11 @@ func (s *MeteringService) Tick(ctx context.Context) error {
 				s.logger.Error("marking skipped event consumed",
 					"event_id", e.EventID, "error", err)
 				s.failed.Add(1)
+				s.recordDrained(ctx, resultFailed)
 				continue
 			}
 			s.skipped.Add(1)
+			s.recordDrained(ctx, resultSkipped)
 			s.logger.Warn("skipping event with no billing identity",
 				"event_id", e.EventID, "event_type", e.EventType)
 			continue
@@ -279,17 +320,31 @@ func (s *MeteringService) Tick(ctx context.Context) error {
 			s.logger.Error("pushing event to Lago",
 				"event_id", e.EventID, "error", err)
 			s.failed.Add(1)
+			s.recordDrained(ctx, resultFailed)
 			continue
 		}
 		if err := s.source.MarkConsumed(ctx, e.EventID); err != nil {
 			s.logger.Error("marking event consumed",
 				"event_id", e.EventID, "error", err)
 			s.failed.Add(1)
+			s.recordDrained(ctx, resultFailed)
 			continue
 		}
 		s.processed.Add(1)
+		s.recordDrained(ctx, resultOK)
 	}
 	return nil
+}
+
+// recordDrained increments the metering.events_drained counter with
+// the given result label. Centralized so the three per-event branches
+// of [Tick] stay readable; the counter is nil-safe (OTel's no-op
+// meter path when no MeterProvider is installed).
+func (s *MeteringService) recordDrained(ctx context.Context, result string) {
+	if s.eventsDrained == nil {
+		return
+	}
+	s.eventsDrained.Add(ctx, 1, metric.WithAttributes(attribute.String("result", result)))
 }
 
 // ctxCanceled reports whether ctx is done — used to suppress noise

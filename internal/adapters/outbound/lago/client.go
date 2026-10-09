@@ -22,6 +22,26 @@ import (
 
 	"github.com/jedi-knights/jk-metering/internal/domain"
 	"github.com/jedi-knights/jk-metering/internal/ports"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
+)
+
+// instrumentationName identifies this package's OTel instrumentation
+// scope. The global MeterProvider resolves it; with no provider
+// installed (tests) the resulting meter is a no-op.
+const instrumentationName = "github.com/jedi-knights/jk-metering/internal/adapters/outbound/lago"
+
+// Status class labels for the metering.lago_push_duration histogram.
+// Kept coarse so dashboards aggregate meaningfully — a 404 and a 429
+// are the same from an operator's perspective: Lago rejected the
+// event. Full status codes live on the span if a specific one needs
+// drill-down.
+const (
+	statusClass2xx    = "2xx"
+	statusClass4xx    = "4xx"
+	statusClass5xx    = "5xx"
+	statusClassErrNet = "network_error"
 )
 
 // DefaultPath is Lago's events endpoint relative to the API root.
@@ -37,6 +57,11 @@ type Client struct {
 	baseURL    string
 	apiKey     string
 	httpClient *http.Client
+
+	// pushDuration records the end-to-end push latency per event
+	// with a coarse status_class label. Lets dashboards alert on
+	// p95 regressions without the cost of a per-event span query.
+	pushDuration metric.Int64Histogram
 }
 
 // Compile-time assertion.
@@ -64,10 +89,27 @@ func New(baseURL, apiKey string, httpClient *http.Client) *Client {
 		httpClient = &http.Client{Timeout: DefaultTimeout}
 	}
 	return &Client{
-		baseURL:    strings.TrimRight(baseURL, "/"),
-		apiKey:     apiKey,
-		httpClient: httpClient,
+		baseURL:      strings.TrimRight(baseURL, "/"),
+		apiKey:       apiKey,
+		httpClient:   httpClient,
+		pushDuration: newPushDurationHistogram(),
 	}
+}
+
+// newPushDurationHistogram constructs the Lago push-duration
+// histogram from the global MeterProvider. A failed registration
+// is unexpected; OTel's returned histogram is always usable (no-op
+// in the error path), so the error is intentionally dropped and the
+// scrape silently returns an empty series until the provider is
+// installed at startup.
+func newPushDurationHistogram() metric.Int64Histogram {
+	meter := otel.Meter(instrumentationName)
+	h, _ := meter.Int64Histogram(
+		"metering.lago_push_duration",
+		metric.WithDescription("Latency of PushEvent calls to Lago, labeled by response status class."),
+		metric.WithUnit("ms"),
+	)
+	return h
 }
 
 // PushEvent posts a single event to Lago. Returns an error on any
@@ -75,6 +117,7 @@ func New(baseURL, apiKey string, httpClient *http.Client) *Client {
 // retryable failure and leaves the audit row unconsumed for the next
 // tick.
 func (c *Client) PushEvent(ctx context.Context, event domain.LagoEvent) error {
+	start := time.Now()
 	body, err := json.Marshal(domain.LagoEventWrapper{Event: event})
 	if err != nil {
 		return fmt.Errorf("marshaling event %s: %w", event.TransactionID, err)
@@ -89,9 +132,12 @@ func (c *Client) PushEvent(ctx context.Context, event domain.LagoEvent) error {
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
+		c.recordDuration(ctx, start, statusClassErrNet)
 		return fmt.Errorf("posting event %s: %w", event.TransactionID, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
+
+	c.recordDuration(ctx, start, statusClassFor(resp.StatusCode))
 
 	if resp.StatusCode/100 != 2 {
 		// Read up to 1 KiB of the response body for the error message —
@@ -105,6 +151,32 @@ func (c *Client) PushEvent(ctx context.Context, event domain.LagoEvent) error {
 		}
 	}
 	return nil
+}
+
+// recordDuration stamps the push-duration histogram with the given
+// status_class label. Nil-safe: OTel's no-op histogram (returned
+// when no MeterProvider is installed) silently discards.
+func (c *Client) recordDuration(ctx context.Context, start time.Time, statusClass string) {
+	if c.pushDuration == nil {
+		return
+	}
+	c.pushDuration.Record(ctx, time.Since(start).Milliseconds(),
+		metric.WithAttributes(attribute.String("status_class", statusClass)))
+}
+
+// statusClassFor maps an HTTP status code to the histogram's coarse
+// label alphabet. Codes outside 2xx-5xx (e.g., 1xx informational,
+// 0 from a hijacked response) are rare enough that bucketing them
+// into "5xx" (treat-as-server-error) keeps the alphabet closed.
+func statusClassFor(code int) string {
+	switch code / 100 {
+	case 2:
+		return statusClass2xx
+	case 4:
+		return statusClass4xx
+	default:
+		return statusClass5xx
+	}
 }
 
 // APIError is returned by [Client.PushEvent] when Lago responds with a
