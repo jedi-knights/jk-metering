@@ -26,7 +26,16 @@ kill_timeout = 30
   METERING_METERING_HEARTBEAT_INTERVAL_SECONDS = "60"
   METERING_METERING_LAG_ALERT_SECONDS = "300"
 
-# This service is a polling worker — no HTTP listener, no Fly-managed
+# Prometheus scrape target. The worker has no main HTTP listener but
+# still exposes /metrics on :9464 (via go-platform/httpserver) for
+# Go runtime + process + OTel contrib runtime metrics, plus any
+# domain counters (metering.events_drained,
+# metering.lago_push_duration) a follow-up registers.
+[metrics]
+  port = 9464
+  path = "/metrics"
+
+# This service is a polling worker — no main HTTP listener, no Fly-managed
 # auto-stop. Keep one machine always-on so audit_events are drained
 # continuously.
 [[vm]]

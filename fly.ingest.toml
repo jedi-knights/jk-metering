@@ -29,6 +29,14 @@ kill_timeout = 30
     timeout = "5s"
     path = "/health"
 
+# Prometheus scrape target per the fleet-wide observability strategy.
+# Served on a separate listener (:9464) so /metrics does not flow
+# through the JWT auth middleware the main /metering/events route
+# requires.
+[metrics]
+  port = 9464
+  path = "/metrics"
+
 [[vm]]
   cpu_kind = "shared"
   cpus = 1
