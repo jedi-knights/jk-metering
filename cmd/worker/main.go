@@ -15,6 +15,9 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/jedi-knights/go-platform/httpserver"
+	platformotel "github.com/jedi-knights/go-platform/otel"
+
 	lagoadapter "github.com/jedi-knights/jk-metering/internal/adapters/outbound/lago"
 	pgadapter "github.com/jedi-knights/jk-metering/internal/adapters/outbound/postgres"
 	"github.com/jedi-knights/jk-metering/internal/application"
@@ -40,6 +43,38 @@ func run() error {
 	ctx, cancel := signal.NotifyContext(context.Background(),
 		syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
+
+	obs, err := platformotel.New(ctx, platformotel.Config{
+		ServiceName: "jk-metering-worker",
+	})
+	if err != nil {
+		return err
+	}
+	defer func() {
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer shutdownCancel()
+		if sErr := obs.Shutdown(shutdownCtx); sErr != nil {
+			logger.Error("observability shutdown error", "error", sErr)
+		}
+	}()
+
+	// Even though the worker has no main HTTP listener, it exposes
+	// /metrics on :9464 so Fly's hosted Prometheus can scrape the
+	// Go runtime + OTel runtime instrumentation metrics (and any
+	// counters this service registers in follow-ups —
+	// metering.events_drained, metering.lago_push_duration).
+	metricsSrv, err := httpserver.StartMetricsServer("", "", obs.PromHandler)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer shutdownCancel()
+		if sErr := metricsSrv.Shutdown(shutdownCtx); sErr != nil {
+			logger.Error("metrics shutdown error", "error", sErr)
+		}
+	}()
+	logger.Info("metrics endpoint ready", "addr", httpserver.DefaultMetricsAddr, "path", httpserver.DefaultMetricsPath)
 
 	pool, err := pgxpool.New(ctx, cfg.Audit.DSN)
 	if err != nil {
@@ -71,6 +106,10 @@ func run() error {
 	return svc.Run(ctx, interval)
 }
 
+// newLogger builds the service's structured logger. The base handler
+// is wrapped by [platformotel.SpanContextHandler] so every record
+// carries trace_id and span_id from any OTel span on the context —
+// matching the fleet-wide log↔trace correlation story.
 func newLogger(cfg config.LogConfig) *slog.Logger {
 	level := slog.LevelInfo
 	switch cfg.Level {
@@ -82,10 +121,12 @@ func newLogger(cfg config.LogConfig) *slog.Logger {
 		level = slog.LevelError
 	}
 	opts := &slog.HandlerOptions{Level: level}
+	var base slog.Handler
 	switch cfg.Format {
 	case "text":
-		return slog.New(slog.NewTextHandler(os.Stderr, opts))
+		base = slog.NewTextHandler(os.Stderr, opts)
 	default:
-		return slog.New(slog.NewJSONHandler(os.Stderr, opts))
+		base = slog.NewJSONHandler(os.Stderr, opts)
 	}
+	return slog.New(platformotel.NewSpanContextHandler(base))
 }
