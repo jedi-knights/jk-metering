@@ -7,7 +7,7 @@ name: Verify metering
 #
 # audit_events lives on a Fly Managed Postgres cluster (jk-identity-pg,
 # shared with the identity services). MPG is not app-based, so the tunnel
-# uses `fly mpg proxy <cluster-id>` — plain `flyctl proxy -a` does not
+# uses `flyctl mpg proxy <cluster-id>` — plain `flyctl proxy -a` does not
 # work against MPG. All endpoints and credentials come from repo secrets
 # so nothing rotatable ends up in this file.
 #
@@ -15,12 +15,24 @@ name: Verify metering
 # PagerDuty by adding a step once a webhook is provisioned).
 
 on:
-  schedule:
-    # Daily at 13:00 UTC (06:00 PT). Chosen to fire after the nightly
-    # heartbeat window in operator-runbook §9 has settled and while
-    # the operator is awake — a failed probe should be actionable in
-    # the same working day.
-    - cron: "0 13 * * *"
+  # Daily schedule paused 2026-10-13 — the probe was firing against an
+  # unconfigured pipeline (no repo secrets or vars set) and filing a new
+  # issue every day since 2026-10-08. Restore the `schedule:` block below
+  # once these inputs exist as repo secrets/vars:
+  #   - secrets: FLY_API_TOKEN, METERING_TEST_TOKEN, METERING_AUDIT_DSN,
+  #     LAGO_API_KEY
+  #   - vars: METERING_AUDIT_PG_CLUSTER_ID (= vmkq60998kp035ln),
+  #     METERING_INGEST_URL, LAGO_BASE_URL
+  # The `metering:emit` scope on METERING_TEST_TOKEN depends on
+  # identity-platform-go's client-registry-service — see
+  # jedi-knights/architecture TODO.md "Blockers / decisions parked".
+  #
+  # schedule:
+  #   # Daily at 13:00 UTC (06:00 PT). Chosen to fire after the nightly
+  #   # heartbeat window in operator-runbook §9 has settled and while
+  #   # the operator is awake — a failed probe should be actionable in
+  #   # the same working day.
+  #   - cron: "0 13 * * *"
   workflow_dispatch: {}
 
 permissions:
@@ -41,16 +53,16 @@ jobs:
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
         run: |
-          nohup fly mpg proxy "${{ vars.METERING_AUDIT_PG_CLUSTER_ID }}" -p 5432 \
+          nohup flyctl mpg proxy "${{ vars.METERING_AUDIT_PG_CLUSTER_ID }}" -p 5432 \
             > /tmp/mpg-proxy.log 2>&1 &
           echo $! > /tmp/mpg-proxy.pid
           # Wait for the tunnel to accept connections. 15s cap is
-          # generous; fly mpg proxy typically binds within 2-3s.
+          # generous; flyctl mpg proxy typically binds within 2-3s.
           for _ in $(seq 1 15); do
             if nc -z 127.0.0.1 5432; then exit 0; fi
             sleep 1
           done
-          echo "fly mpg proxy did not bind localhost:5432 within 15s" >&2
+          echo "flyctl mpg proxy did not bind localhost:5432 within 15s" >&2
           cat /tmp/mpg-proxy.log >&2
           exit 1
 
